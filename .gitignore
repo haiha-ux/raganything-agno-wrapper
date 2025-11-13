@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.log
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# RAG Storage (local knowledge bases)
+test_*_rag_storage/
+*_rag_storage/
+rag_storage/
+knowledge_base/
+output/
+parsed_output/
+
+# Test outputs
+*.txt
+test_results/
+excel_test_results.txt
+
+# Test data (large files)
+test_case_data/*.xlsx
+test_case_data/*.pdf
+test_case_data/*.docx
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment variables
+.env
+.env.local
+
+# LightRAG data
+*.graphml
+*.json
+vdb_*.json
+llm_cache/

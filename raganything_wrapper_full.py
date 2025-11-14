@@ -20,13 +20,11 @@ Features Implemented:
 """
 
 from typing import Any, Dict, List, Optional, Tuple, Set, Callable
-from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import asyncio
 import logging
 import os
 import threading
-from concurrent.futures import Future
 
 from agno.knowledge import Knowledge
 from agno.knowledge.document import Document
@@ -130,6 +128,13 @@ class RAGAnythingConfig:
     # Text splitting
     split_by_character: Optional[str] = None  # Character to split text by
     split_by_character_only: bool = False  # Split only by character (no other chunking)
+
+    # Citation extraction (Universal for all domains)
+    enable_citation_extraction: bool = True  # Auto-extract URLs/references from chunks
+    max_citations: int = 5  # Maximum citations to show
+    citation_style: str = "grouped"  # "grouped" (by domain), "list" (flat list), or "none"
+    citation_label: str = "References"  # Label for citation section (customizable per language)
+
 
     def to_rag_config(self) -> RAGConfig:
         """Convert to RAG-Anything's native config format"""
@@ -326,8 +331,22 @@ class RAGAnythingWrapper(Knowledge):
                 ),
                 timeout=120  # 2 min timeout
             )
-
+            
             logger.info(f"✅ [SEARCH] aquery returned: {len(response_text)} chars")
+
+            # DEBUG: Log first 500 chars to check if links are present in raw response
+            preview = response_text[:500] if len(response_text) > 500 else response_text
+            logger.info(f"🔍 [DEBUG] Raw LightRAG response preview: {preview}")
+
+            # ENHANCEMENT: Extract URLs from chunks and append to response
+            try:
+                urls = await self._extract_urls_from_chunks(query, mode)
+                if urls:
+                    formatted_urls = self._format_citations_for_response(urls)
+                    response_text = response_text + formatted_urls
+                    logger.info(f"✅ [URL INJECTION] Appended {len(urls)} URLs to response")
+            except Exception as e:
+                logger.warning(f"⚠️  URL extraction failed (non-critical): {e}")
 
             # Convert string response to Document list
             documents = self._convert_to_documents(response_text, query)
@@ -875,6 +894,142 @@ class RAGAnythingWrapper(Knowledge):
             return "global"
         else:
             return "hybrid"  # Default
+        
+    async def _extract_urls_from_chunks(self, query: str, mode: str = "hybrid") -> Dict[str, Any]:
+        """
+        Universal citation extraction from retrieved chunks.
+
+        Extracts all types of references without domain-specific logic.
+        Works for ANY domain: healthcare, legal, education, e-commerce, etc.
+
+        Args:
+            query: The original query
+            mode: Query mode used
+
+        Returns:
+            Dict with structured citations:
+            {
+                "urls": [...],           # All URLs found
+                "documents": [...],      # Document sources
+                "chunks_with_refs": [...] # Chunks containing references
+            }
+        """
+        try:
+            import re
+            from urllib.parse import urlparse
+
+            # Access LightRAG instance
+            lightrag = self.rag_anything.lightrag
+            if not lightrag or not hasattr(lightrag, 'text_chunks'):
+                return {"urls": [], "documents": [], "chunks_with_refs": []}
+
+            # Get all chunks from store
+            all_urls = set()
+            doc_sources = set()
+            chunks_with_refs = []
+
+            chunk_store = lightrag.text_chunks
+
+            if hasattr(chunk_store, '_data') and chunk_store._data:
+                # Iterate through all stored chunks
+                for doc_id, chunk_data in chunk_store._data.items():
+                    if not chunk_data:
+                        continue
+
+                    content = chunk_data.get('content', '')
+                    if not content:
+                        continue
+
+                    # Extract URLs (http, https, ftp, etc.)
+                    urls = re.findall(r'https?://[^\s\)\]\,\"\'\>\<]+', content)
+                    if urls:
+                        all_urls.update(urls)
+                        chunks_with_refs.append({
+                            'doc_id': doc_id,
+                            'urls': urls,
+                            'content_preview': content[:200]
+                        })
+
+                    # Extract document references (e.g., "Source: doc.pdf", "See: paper.docx")
+                    doc_refs = re.findall(r'(?:Source|See|Reference|Ref):\s*([^\s\.\,]+\.(?:pdf|docx?|txt|html))', content, re.IGNORECASE)
+                    if doc_refs:
+                        doc_sources.update(doc_refs)
+
+            citations = {
+                "urls": list(all_urls),
+                "documents": list(doc_sources),
+                "chunks_with_refs": chunks_with_refs
+            }
+
+            logger.info(f"🔗 [CITATION EXTRACTION] Found {len(all_urls)} URLs, {len(doc_sources)} document refs")
+            return citations
+
+        except Exception as e:
+            logger.warning(f"⚠️  Citation extraction failed (non-critical): {e}")
+            return {"urls": [], "documents": [], "chunks_with_refs": []}
+
+    def _format_citations_for_response(self, citations: Dict[str, Any]) -> str:
+        """
+        Universal citation formatting for any domain.
+
+        Automatically groups URLs by domain and formats naturally.
+        No hard-coded domain filtering - works for ANY knowledge base.
+
+        Args:
+            citations: Dict from _extract_urls_from_chunks()
+
+        Returns:
+            Formatted citation string (empty if no citations or disabled)
+        """
+        # Check if citation extraction is enabled
+        if not self.config.enable_citation_extraction:
+            return ""
+
+        urls = citations.get("urls", [])
+        documents = citations.get("documents", [])
+
+        if not urls and not documents:
+            return ""
+
+        # Check citation style
+        if self.config.citation_style == "none":
+            return ""
+
+        # Build citation section header
+        formatted = f"\n\n📚 {self.config.citation_label}:\n"
+
+        # Format based on style
+        if self.config.citation_style == "grouped":
+            # Auto-group by domain
+            from urllib.parse import urlparse
+            from collections import defaultdict
+
+            domain_groups = defaultdict(list)
+            for url in urls[:self.config.max_citations]:
+                try:
+                    parsed = urlparse(url)
+                    domain = parsed.netloc or "other"
+                    # Simplify domain (remove www, subdomain if common)
+                    domain = domain.replace('www.', '')
+                    domain_groups[domain].append(url)
+                except:
+                    domain_groups["other"].append(url)
+
+            # Format each domain group
+            for domain, domain_urls in sorted(domain_groups.items()):
+                formatted += f"• {domain.title()}: " + ", ".join(domain_urls[:3]) + "\n"
+
+        elif self.config.citation_style == "list":
+            # Flat list
+            for i, url in enumerate(urls[:self.config.max_citations], 1):
+                formatted += f"{i}. {url}\n"
+
+        # Add document references if any
+        if documents:
+            formatted += f"• Documents: " + ", ".join(documents[:3]) + "\n"
+
+        return formatted.rstrip()
+
 
     def _convert_to_documents(self, response_text: str, query: str) -> List[Document]:
         """
@@ -966,26 +1121,6 @@ class RAGAnythingWrapper(Knowledge):
 
             # Count chunks from KV store
             chunk_count = 0
-            if hasattr(lightrag, 'text_chunks') and lightrag.text_chunks:
-                try:
-                    all_doc_ids = list(lightrag.text_chunks._data.keys()) if hasattr(lightrag.text_chunks, '_data') else []
-                    all_chunks = await lightrag.text_chunks.get_by_ids(all_doc_ids)
-                    chunk_count = len([c for c in all_chunks if c is not None])
-                except Exception as e:
-                    logger.warning(f'Failed to count chunks: {e}')
-
-            logger.info(f"📊 Graph stats: {entity_count} entities, {relation_count} relations, {chunk_count} chunks")
-
-            return {
-                "total_entities": entity_count,
-                "total_relations": relation_count,
-                "total_chunks": chunk_count
-            }
-
-        except Exception as e:
-            logger.error(f"Failed to get graph stats: {e}", exc_info=True)
-            return {"total_entities": 0, "total_relations": 0, "total_chunks": 0}
-
             if hasattr(lightrag, 'text_chunks') and lightrag.text_chunks:
                 try:
                     all_doc_ids = list(lightrag.text_chunks._data.keys()) if hasattr(lightrag.text_chunks, '_data') else []
@@ -1210,10 +1345,10 @@ def create_raganything_wrapper(
         working_dir=config.working_dir,
         llm_model_func=llm_model_func,
         embedding_func=embedding_func,
-        # Use minimal workers - errors will appear but queries complete
-        # ThreadPoolExecutor isolation will handle event loop conflicts
-        embedding_func_max_async=2,
-        llm_model_max_async=2,
+        # Increased workers for better performance (balanced with stability)
+        # PersistentEventLoopThread handles event loop isolation
+        embedding_func_max_async=4,
+        llm_model_max_async=4,
     )
 
     # Create RAG-Anything instance with pre-created LightRAG

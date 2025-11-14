@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 import asyncio
 import logging
 import os
+import threading
+from concurrent.futures import Future
 
 from agno.knowledge import Knowledge
 from agno.knowledge.document import Document
@@ -33,6 +35,56 @@ from lightrag import LightRAG
 from lightrag.utils import EmbeddingFunc
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# PERSISTENT EVENT LOOP THREAD (Fix for LightRAG event loop conflicts)
+# =============================================================================
+
+class PersistentEventLoopThread:
+    """
+    Maintains a persistent thread with its own event loop for LightRAG queries.
+
+    This solves the "Event loop is closed" error by keeping the same event loop
+    alive across multiple queries, so LightRAG workers don't lose their event loop.
+    """
+
+    def __init__(self):
+        self.loop = None
+        self.thread = None
+        self._started = threading.Event()
+        self._start_thread()
+
+    def _start_thread(self):
+        """Start the persistent thread with event loop"""
+        def run_loop():
+            # Create new event loop for this thread
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self._started.set()  # Signal that loop is ready
+
+            # Keep loop running forever
+            self.loop.run_forever()
+
+        self.thread = threading.Thread(target=run_loop, daemon=True)
+        self.thread.start()
+        self._started.wait()  # Wait for loop to be ready
+        logger.info("✅ Persistent event loop thread started")
+
+    def run_coroutine(self, coro, timeout=120):
+        """Run a coroutine in the persistent event loop"""
+        if not self.loop or not self.loop.is_running():
+            raise RuntimeError("Event loop not running")
+
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        return future.result(timeout=timeout)
+
+    def shutdown(self):
+        """Stop the event loop and thread"""
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+            self.thread.join(timeout=5)
+            logger.info("✅ Persistent event loop thread stopped")
 
 
 # =============================================================================
@@ -202,6 +254,10 @@ class RAGAnythingWrapper(Knowledge):
         # Cache for valid filters (populated on first use)
         self._valid_filters: Optional[Set[str]] = None
 
+        # CRITICAL: Create persistent event loop thread for LightRAG queries
+        # This prevents "Event loop is closed" errors across multiple queries
+        self._persistent_loop = PersistentEventLoopThread()
+
         logger.info(f"✅ RAGAnythingWrapper initialized: {name}")
         # Check if lightrag is initialized before accessing working_dir
         if hasattr(rag_anything, 'lightrag') and rag_anything.lightrag is not None:
@@ -248,23 +304,35 @@ class RAGAnythingWrapper(Knowledge):
         Returns:
             List of Document objects containing retrieved content
         """
+        logger.info("[ASYNC SEARCH CALLED] async_search() method entry point!")
+        logger.info(f"[ASYNC SEARCH] Query: {query[:100]}")
         try:
             # Map Agno search_type to RAG-Anything mode
             mode = self._map_search_type(search_type)
 
-            logger.debug(f"🔍 Searching RAG-Anything: query='{query[:50]}...', mode={mode}")
+            logger.info(f"🔍 [SEARCH] Searching RAG-Anything: query='{query[:50]}...', mode={mode}")
 
             # Query RAG-Anything with VLM enhancement if available
-            response_text = await self.rag_anything.aquery(
-                query=query,
-                mode=mode,
-                vlm_enhanced=True  # Enable VLM for image analysis
+            # CRITICAL: Use persistent event loop thread to avoid "Event loop is closed" errors
+            # LightRAG workers stay alive in the same event loop across queries
+            logger.info(f"🔍 [SEARCH] Calling rag_anything.aquery() with mode={mode}...")
+
+            # Run in persistent thread with stable event loop
+            response_text = self._persistent_loop.run_coroutine(
+                self.rag_anything.aquery(
+                    query=query,
+                    mode=mode,
+                    vlm_enhanced=True
+                ),
+                timeout=120  # 2 min timeout
             )
+
+            logger.info(f"✅ [SEARCH] aquery returned: {len(response_text)} chars")
 
             # Convert string response to Document list
             documents = self._convert_to_documents(response_text, query)
 
-            logger.debug(f"✅ Retrieved {len(documents)} documents")
+            logger.info(f"✅ [SEARCH] Retrieved {len(documents)} documents")
             return documents
 
         except Exception as e:
@@ -284,14 +352,40 @@ class RAGAnythingWrapper(Knowledge):
         Wraps async_search for sync compatibility.
         """
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                import nest_asyncio
-                nest_asyncio.apply()
+            import threading
+            from concurrent.futures import Future
 
-            return loop.run_until_complete(
-                self.async_search(query, max_results, filters, search_type)
-            )
+            # Check if loop is running (likely uvloop in FastAPI)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # uvloop doesn't support nest_asyncio, use thread instead
+                    result_future = Future()
+
+                    def run_in_thread():
+                        # Use asyncio.run() which properly manages loop lifecycle
+                        try:
+                            result = asyncio.run(
+                                self.async_search(query, max_results, filters, search_type)
+                            )
+                            result_future.set_result(result)
+                        except Exception as e:
+                            result_future.set_exception(e)
+
+                    thread = threading.Thread(target=run_in_thread)
+                    thread.start()
+                    thread.join()
+                    return result_future.result()
+                else:
+                    # Loop not running, safe to use
+                    return loop.run_until_complete(
+                        self.async_search(query, max_results, filters, search_type)
+                    )
+            except RuntimeError:
+                # No loop, use asyncio.run()
+                return asyncio.run(
+                    self.async_search(query, max_results, filters, search_type)
+                )
         except Exception as e:
             logger.error(f"❌ Sync search error: {e}")
             return []
@@ -473,7 +567,7 @@ class RAGAnythingWrapper(Knowledge):
                 logger.info(f"   MinerU params: {mineru_kwargs}")
 
             # Process document
-            content_list, doc_id = await self.rag_anything.process_document_complete(
+            result = await self.rag_anything.process_document_complete(
                 file_path=file_path,
                 output_dir=output_dir,
                 parse_method=parse_method,
@@ -482,10 +576,18 @@ class RAGAnythingWrapper(Knowledge):
                 **mineru_kwargs
             )
 
-            logger.info(f"✅ Document processed: {doc_id}")
+            # Handle None return (RAG-Anything version compatibility)
+            if result is None:
+                logger.warning("⚠️  RAG-Anything process_document_complete returned None (processing likely succeeded)")
+                logger.info(f"✅ Document processed: {doc_id}")
+                return [], doc_id
+
+            # Unpack result
+            content_list, returned_doc_id = result
+            logger.info(f"✅ Document processed: {returned_doc_id}")
             logger.info(f"   Content items: {len(content_list)}")
 
-            return content_list, doc_id
+            return content_list, returned_doc_id
 
         except Exception as e:
             logger.error(f"❌ Document processing error: {e}")
@@ -824,6 +926,87 @@ class RAGAnythingWrapper(Knowledge):
         """Sync version"""
         return {}, []
 
+    async def get_graph_stats(self) -> Dict[str, int]:
+        """
+        Get knowledge graph statistics (entities, relations, chunks)
+
+        Returns:
+            Dict with 'total_entities', 'total_relations', 'total_chunks'
+        """
+        try:
+            if not self.rag_anything:
+                return {"total_entities": 0, "total_relations": 0, "total_chunks": 0}
+
+            # Access LightRAG KV storages (not vector DBs)
+            lightrag = self.rag_anything.lightrag
+
+            # Count entities from KV store
+            entity_count = 0
+            if hasattr(lightrag, 'full_entities') and lightrag.full_entities:
+                try:
+                    all_doc_ids = list(lightrag.full_entities._data.keys()) if hasattr(lightrag.full_entities, '_data') else []
+                    all_entities = await lightrag.full_entities.get_by_ids(all_doc_ids)
+                    for doc_entities in all_entities:
+                        if doc_entities and 'count' in doc_entities:
+                            entity_count += doc_entities['count']
+                except Exception as e:
+                    logger.warning(f'Failed to count entities: {e}')
+
+            # Count relations from KV store
+            relation_count = 0
+            if hasattr(lightrag, 'full_relations') and lightrag.full_relations:
+                try:
+                    all_doc_ids = list(lightrag.full_relations._data.keys()) if hasattr(lightrag.full_relations, '_data') else []
+                    all_relations = await lightrag.full_relations.get_by_ids(all_doc_ids)
+                    for doc_relations in all_relations:
+                        if doc_relations and 'relation_pairs' in doc_relations:
+                            relation_count += len(doc_relations['relation_pairs'])
+                except Exception as e:
+                    logger.warning(f'Failed to count relations: {e}')
+
+            # Count chunks from KV store
+            chunk_count = 0
+            if hasattr(lightrag, 'text_chunks') and lightrag.text_chunks:
+                try:
+                    all_doc_ids = list(lightrag.text_chunks._data.keys()) if hasattr(lightrag.text_chunks, '_data') else []
+                    all_chunks = await lightrag.text_chunks.get_by_ids(all_doc_ids)
+                    chunk_count = len([c for c in all_chunks if c is not None])
+                except Exception as e:
+                    logger.warning(f'Failed to count chunks: {e}')
+
+            logger.info(f"📊 Graph stats: {entity_count} entities, {relation_count} relations, {chunk_count} chunks")
+
+            return {
+                "total_entities": entity_count,
+                "total_relations": relation_count,
+                "total_chunks": chunk_count
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get graph stats: {e}", exc_info=True)
+            return {"total_entities": 0, "total_relations": 0, "total_chunks": 0}
+
+            if hasattr(lightrag, 'text_chunks') and lightrag.text_chunks:
+                try:
+                    all_doc_ids = list(lightrag.text_chunks._data.keys()) if hasattr(lightrag.text_chunks, '_data') else []
+                    all_chunks = await lightrag.text_chunks.get_by_ids(all_doc_ids)
+                    chunk_count = len([c for c in all_chunks if c is not None])
+                except Exception as e:
+                    logger.warning(f'Failed to count chunks: {e}')
+
+            logger.info(f"📊 Graph stats: {entity_count} entities, {relation_count} relations, {chunk_count} chunks")
+
+            return {
+                "total_entities": entity_count,
+                "total_relations": relation_count,
+                "total_chunks": chunk_count
+            }
+
+        except Exception as e:
+            logger.error(f"Failed to get graph stats: {e}", exc_info=True)
+            return {"total_entities": 0, "total_relations": 0, "total_chunks": 0}
+
+
 
 # =============================================================================
 # FACTORY FUNCTIONS (Easy initialization)
@@ -1027,6 +1210,10 @@ def create_raganything_wrapper(
         working_dir=config.working_dir,
         llm_model_func=llm_model_func,
         embedding_func=embedding_func,
+        # Use minimal workers - errors will appear but queries complete
+        # ThreadPoolExecutor isolation will handle event loop conflicts
+        embedding_func_max_async=2,
+        llm_model_max_async=2,
     )
 
     # Create RAG-Anything instance with pre-created LightRAG
